@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Доступный тюнер укулеле</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: system-ui, sans-serif;
+    line-height: 1.5;
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 1rem;
+  }
+  h1 { line-height: 1.2; }
+  button, select {
+    font: inherit;
+    padding: .7rem .9rem;
+    margin: .25rem 0;
+  }
+  button:focus-visible, select:focus-visible {
+    outline: 3px solid currentColor;
+    outline-offset: 3px;
+  }
+  fieldset {
+    margin: 1rem 0;
+    padding: 1rem;
+  }
+  .strings {
+    display: grid;
+    gap: .5rem;
+  }
+  .string-button {
+    display: block;
+    width: 100%;
+    text-align: left;
+  }
+  .selected { font-weight: 700; }
+  .panel {
+    border: 2px solid currentColor;
+    border-radius: .6rem;
+    padding: 1rem;
+    margin-top: 1rem;
+  }
+  .value { font-size: 1.5rem; font-weight: 700; }
+  .visually-hidden {
+    position: absolute !important;
+    width: 1px; height: 1px; padding: 0; margin: -1px;
+    overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0;
+  }
+  .hint { opacity: .85; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Тюнер укулеле</h1>
+  <p class="hint">
+    Доступный тюнер для стандартного строя G–C–E–A.
+    Выберите струну, включите микрофон и сыграйте одну струну.
+  </p>
+
+  <fieldset>
+    <legend>Струна</legend>
+    <div class="strings">
+      <button type="button" class="string-button selected" data-note="G4" data-freq="392.00">
+        4-я струна — G4 — 392 Гц
+      </button>
+      <button type="button" class="string-button" data-note="C4" data-freq="261.63">
+        3-я струна — C4 — 261,63 Гц
+      </button>
+      <button type="button" class="string-button" data-note="E4" data-freq="329.63">
+        2-я струна — E4 — 329,63 Гц
+      </button>
+      <button type="button" class="string-button" data-note="A4" data-freq="440.00">
+        1-я струна — A4 — 440 Гц
+      </button>
+    </div>
+  </fieldset>
+
+  <button id="micButton" type="button">Включить микрофон</button>
+  <button id="referenceButton" type="button">Проиграть эталонную ноту</button>
+
+  <section class="panel" aria-labelledby="resultHeading">
+    <h2 id="resultHeading">Результат настройки</h2>
+
+    <p>
+      Выбрана:
+      <span id="targetText" class="value">4-я струна, G4</span>.
+      Целевая частота:
+      <span id="targetFreq" class="value">392,00 Гц</span>.
+    </p>
+
+    <p id="detectedText" class="value">Нота не определена.</p>
+    <p id="frequencyText">Частота: —</p>
+    <p id="centsText">Отклонение: —</p>
+    <p id="statusText" class="value">Микрофон выключен.</p>
+  </section>
+
+  <div id="live" class="visually-hidden" aria-live="polite" aria-atomic="true"></div>
+
+  <details>
+    <summary>Как пользоваться</summary>
+    <ol>
+      <li>Выберите струну.</li>
+      <li>Нажмите «Включить микрофон» и разрешите доступ к микрофону.</li>
+      <li>Сыграйте выбранную струну отдельно.</li>
+      <li>Настройте струну так, чтобы сообщение стало «Настроено».</li>
+    </ol>
+    <p>
+      Если браузер не разрешает доступ к микрофону, откройте приложение через HTTPS
+      или с локального веб-сервера.
+    </p>
+  </details>
+</main>
+
+<script>
+(() => {
+  "use strict";
+
+  const buttons = [...document.querySelectorAll(".string-button")];
+  const micButton = document.getElementById("micButton");
+  const referenceButton = document.getElementById("referenceButton");
+  const targetText = document.getElementById("targetText");
+  const targetFreq = document.getElementById("targetFreq");
+  const detectedText = document.getElementById("detectedText");
+  const frequencyText = document.getElementById("frequencyText");
+  const centsText = document.getElementById("centsText");
+  const statusText = document.getElementById("statusText");
+  const live = document.getElementById("live");
+
+  let target = { note: "G4", freq: 392.00, stringName: "4-я струна" };
+  let audioContext = null;
+  let analyser = null;
+  let source = null;
+  let stream = null;
+  let buffer = null;
+  let running = false;
+  let lastAnnouncement = "";
+  let lastAnnouncementTime = 0;
+
+  const notes = [
+    ["C", 0], ["C#", 1], ["D", 2], ["D#", 3], ["E", 4], ["F", 5],
+    ["F#", 6], ["G", 7], ["G#", 8], ["A", 9], ["A#", 10], ["B", 11]
+  ];
+
+  function formatHz(n) {
+    return n.toLocaleString("ru-RU", { minimumFractionDigits: 1, maximumFractionDigits: 2 });
+  }
+
+  function announce(text, force = false) {
+    const now = performance.now();
+    if (!force && text === lastAnnouncement && now - lastAnnouncementTime < 1200) return;
+    lastAnnouncement = text;
+    lastAnnouncementTime = now;
+    live.textContent = "";
+    requestAnimationFrame(() => { live.textContent = text; });
+  }
+
+  function noteFromFrequency(freq) {
+    if (!Number.isFinite(freq) || freq <= 0) return null;
+    const midi = 69 + 12 * Math.log2(freq / 440);
+    const rounded = Math.round(midi);
+    const cents = (midi - rounded) * 100;
+    const octave = Math.floor(rounded / 12) - 1;
+    const pc = ((rounded % 12) + 12) % 12;
+    return { name: notes[pc][0] + octave, cents };
+  }
+
+  // Autocorrelation pitch detector. It is intentionally simple and runs locally.
+  function detectPitch(data, sampleRate) {
+    let rms = 0;
+    for (let i = 0; i < data.length; i++) rms += data[i] * data[i];
+    rms = Math.sqrt(rms / data.length);
+    if (rms < 0.012) return null;
+
+    let start = 0, end = data.length - 1;
+    const threshold = 0.2;
+    while (start < end && Math.abs(data[start]) < threshold) start++;
+    while (end > start && Math.abs(data[end]) < threshold) end--;
+    if (end - start < 100) return null;
+
+    const minFreq = 70;
+    const maxFreq = 900;
+    const minLag = Math.floor(sampleRate / maxFreq);
+    const maxLag = Math.min(Math.floor(sampleRate / minFreq), data.length - 2);
+
+    let bestLag = -1;
+    let bestCorr = 0;
+
+    for (let lag = minLag; lag <= maxLag; lag++) {
+      let corr = 0, normA = 0, normB = 0;
+      const limit = data.length - lag;
+      for (let i = 0; i < limit; i++) {
+        const a = data[i], b = data[i + lag];
+        corr += a * b;
+        normA += a * a;
+        normB += b * b;
+      }
+      const normalized = corr / Math.sqrt((normA * normB) || 1);
+      if (normalized > bestCorr) {
+        bestCorr = normalized;
+        bestLag = lag;
+      }
+    }
+
+    if (bestLag < 0 || bestCorr < 0.65) return null;
+
+    // Small parabolic interpolation around the correlation peak.
+    const corrAt = (lag) => {
+      let corr = 0, normA = 0, normB = 0;
+      const limit = data.length - lag;
+      for (let i = 0; i < limit; i++) {
+        const a = data[i], b = data[i + lag];
+        corr += a * b; normA += a * a; normB += b * b;
+      }
+      return corr / Math.sqrt((normA * normB) || 1);
+    };
+
+    let refined = bestLag;
+    if (bestLag > minLag && bestLag < maxLag) {
+      const y1 = corrAt(bestLag - 1);
+      const y2 = bestCorr;
+      const y3 = corrAt(bestLag + 1);
+      const denom = y1 - 2 * y2 + y3;
+      if (Math.abs(denom) > 1e-9) {
+        refined += 0.5 * (y1 - y3) / denom;
+      }
+    }
+
+    return sampleRate / refined;
+  }
+
+  function updateResult(freq) {
+    const detected = noteFromFrequency(freq);
+    if (!detected) {
+      detectedText.textContent = "Нота не определена.";
+      frequencyText.textContent = "Частота: —";
+      centsText.textContent = "Отклонение: —";
+      statusText.textContent = "Сыграйте выбранную струну отдельно.";
+      return;
+    }
+
+    const centsToTarget = 1200 * Math.log2(freq / target.freq);
+    const abs = Math.abs(centsToTarget);
+
+    detectedText.textContent = `Обнаружена нота: ${detected.name}.`;
+    frequencyText.textContent = `Частота: ${formatHz(freq)} Гц.`;
+    centsText.textContent =
+      `Отклонение от ${target.note}: ${centsToTarget >= 0 ? "+" : ""}${centsToTarget.toFixed(1)} цента.`;
+
+    let status;
+    if (abs <= 3) status = "Настроено.";
+    else if (centsToTarget < 0) status = "Ниже нормы. Натяните струну.";
+    else status = "Выше нормы. Ослабьте струну.";
+
+    statusText.textContent = status;
+
+    const announcement =
+      `${detected.name}. ${formatHz(freq)} Гц. ` +
+      `${centsToTarget >= 0 ? "Выше" : "Ниже"} нормы на ${abs.toFixed(0)} центов. ${status}`;
+
+    if (abs <= 3) announce(`${target.stringName}, ${target.note}. Настроено.`, false);
+    else announce(announcement, false);
+  }
+
+  async function startMic() {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      statusText.textContent = "Этот браузер не поддерживает доступ к микрофону.";
+      announce("Ошибка. Браузер не поддерживает доступ к микрофону.", true);
+      return;
+    }
+
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: false,
+          autoGainControl: false,
+          noiseSuppression: false
+        },
+        video: false
+      });
+
+      audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      await audioContext.resume();
+      source = audioContext.createMediaStreamSource(stream);
+      analyser = audioContext.createAnalyser();
+      analyser.fftSize = 4096;
+      analyser.smoothingTimeConstant = 0.05;
+      source.connect(analyser);
+      buffer = new Float32Array(analyser.fftSize);
+
+      running = true;
+      micButton.textContent = "Выключить микрофон";
+      statusText.textContent = "Микрофон включён. Сыграйте выбранную струну.";
+      announce("Микрофон включён. Сыграйте выбранную струну.", true);
+      requestAnimationFrame(loop);
+    } catch (err) {
+      let message = "Не удалось включить микрофон.";
+      if (err.name === "NotAllowedError") message += " Доступ к микрофону запрещён.";
+      else if (err.name === "NotFoundError") message += " Микрофон не найден.";
+      statusText.textContent = message;
+      announce(message, true);
+    }
+  }
+
+  function stopMic() {
+    running = false;
+    if (stream) stream.getTracks().forEach(track => track.stop());
+    if (source) source.disconnect();
+    if (audioContext) audioContext.close();
+    stream = null; source = null; analyser = null; audioContext = null;
+    micButton.textContent = "Включить микрофон";
+    statusText.textContent = "Микрофон выключен.";
+    detectedText.textContent = "Нота не определена.";
+    frequencyText.textContent = "Частота: —";
+    centsText.textContent = "Отклонение: —";
+    announce("Микрофон выключен.", true);
+  }
+
+  function loop() {
+    if (!running || !analyser) return;
+    analyser.getFloatTimeDomainData(buffer);
+    const freq = detectPitch(buffer, audioContext.sampleRate);
+    if (freq) updateResult(freq);
+    requestAnimationFrame(loop);
+  }
+
+  buttons.forEach((button, index) => {
+    button.addEventListener("click", () => {
+      buttons.forEach(b => {
+        b.classList.remove("selected");
+        b.removeAttribute("aria-current");
+      });
+      button.classList.add("selected");
+      button.setAttribute("aria-current", "true");
+
+      target = {
+        note: button.dataset.note,
+        freq: Number(button.dataset.freq),
+        stringName: button.textContent.trim().split("—")[0].trim()
+      };
+
+      targetText.textContent = `${target.stringName}, ${target.note}`;
+      targetFreq.textContent = `${formatHz(target.freq)} Гц`;
+      statusText.textContent = `Выбрана ${target.stringName}, ${target.note}.`;
+      announce(`Выбрана ${target.stringName}, ${target.note}. Целевая частота ${formatHz(target.freq)} Гц.`, true);
+    });
+  });
+
+  buttons[0].setAttribute("aria-current", "true");
+
+  micButton.addEventListener("click", () => {
+    if (running) stopMic();
+    else startMic();
+  });
+
+  referenceButton.addEventListener("click", async () => {
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      await ctx.resume();
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.type = "sine";
+      oscillator.frequency.value = target.freq;
+      gain.gain.setValueAtTime(0.0001, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.15, ctx.currentTime + 0.03);
+      gain.gain.exponentialRampToValueAtTime(0.0001, ctx.currentTime + 1.5);
+      oscillator.connect(gain).connect(ctx.destination);
+      oscillator.start();
+      oscillator.stop(ctx.currentTime + 1.5);
+      announce(`Эталонная нота ${target.note}, ${formatHz(target.freq)} Гц.`, true);
+      setTimeout(() => ctx.close(), 1800);
+    } catch {
+      announce("Не удалось проиграть эталонную ноту.", true);
+    }
+  });
+})();
+</script>
+</body>
+</html>
