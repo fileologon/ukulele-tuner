@@ -170,106 +170,80 @@
   // Устойчивое определение высоты тона. Поскольку пользователь заранее
   // выбирает струну, используем её частоту как подсказку: это сильно
   // уменьшает ошибки на октаву и скачки между гармониками.
+  // YIN-подобный детектор высоты тона. Для укулеле он надёжнее простой
+  // автокорреляции: гармоники не так легко принимаются за основную частоту.
+  // Мы заранее знаем выбранную струну, поэтому разрешаем только диапазон
+  // примерно ±600 центов вокруг её эталона — целая октава туда не попадает.
   function detectPitch(data, sampleRate) {
+    const targetFreq = target.freq;
+    const minFreq = targetFreq * Math.pow(2, -0.50); // -600 центов
+    const maxFreq = targetFreq * Math.pow(2,  0.50); // +600 центов
+    const minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
+    const maxLag = Math.min(Math.floor(sampleRate / minFreq), data.length - 2);
+
+    if (maxLag <= minLag + 4) return null;
+
+    // Убираем постоянную составляющую и применяем окно Хэнна.
     let mean = 0;
     for (let i = 0; i < data.length; i++) mean += data[i];
     mean /= data.length;
 
-    let energy = 0;
+    const x = new Float32Array(data.length);
+    let rms = 0;
     for (let i = 0; i < data.length; i++) {
-      const x = data[i] - mean;
-      energy += x * x;
+      const w = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (data.length - 1));
+      x[i] = (data[i] - mean) * w;
+      rms += x[i] * x[i];
     }
-    const rms = Math.sqrt(energy / data.length);
-    if (rms < 0.0007) return null;
+    rms = Math.sqrt(rms / data.length);
+    if (rms < 0.00035) return null;
 
-    // Для настройки ищем фундаментальную частоту вокруг выбранной струны.
-    // Диапазон примерно от -600 до +600 центов допускает заметно расстроенную
-    // струну, но не даёт алгоритму свободно перескакивать между октавами.
-    const targetFreq = target.freq;
-    const minFreq = Math.max(70, targetFreq * Math.pow(2, -0.52));
-    const maxFreq = Math.min(900, targetFreq * Math.pow(2, 0.52));
-    const minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
-    const maxLag = Math.min(Math.ceil(sampleRate / minFreq), data.length - 2);
+    const diff = new Float32Array(maxLag + 1);
+    const cmnd = new Float32Array(maxLag + 1);
+    let runningSum = 0;
 
-    const corrAt = (lag) => {
-      let corr = 0, normA = 0, normB = 0;
-      const limit = data.length - lag;
+    for (let tau = 1; tau <= maxLag; tau++) {
+      let sum = 0;
+      const limit = data.length - tau;
       for (let i = 0; i < limit; i++) {
-        const a = data[i] - mean;
-        const b = data[i + lag] - mean;
-        corr += a * b;
-        normA += a * a;
-        normB += b * b;
+        const d = x[i] - x[i + tau];
+        sum += d * d;
       }
-      return corr / Math.sqrt((normA * normB) || 1);
-    };
+      diff[tau] = sum;
+      runningSum += sum;
+      cmnd[tau] = runningSum > 0 ? sum * tau / runningSum : 1;
+    }
 
-    const correlations = new Float32Array(maxLag + 1);
-    let bestCorr = -1;
-    let bestLag = -1;
-
-    for (let lag = minLag; lag <= maxLag; lag++) {
-      const c = corrAt(lag);
-      correlations[lag] = c;
-      if (c > bestCorr) {
-        bestCorr = c;
-        bestLag = lag;
+    // Ищем первый достаточно глубокий минимум. Это важнее глобального
+    // максимума корреляции: именно так уменьшаются скачки на октаву.
+    const threshold = 0.18;
+    let tau = -1;
+    for (let t = minLag + 1; t < maxLag - 1; t++) {
+      if (cmnd[t] < threshold && cmnd[t] <= cmnd[t - 1] && cmnd[t] <= cmnd[t + 1]) {
+        tau = t;
+        break;
       }
     }
 
-    if (bestLag < 0 || bestCorr < 0.12) return null;
-
-    // Собираем локальные пики автокорреляции. Если несколько пиков почти
-    // одинаково сильны, выбираем тот, чья частота ближе к выбранной струне.
-    const candidates = [];
-    const peakThreshold = Math.max(0.12, bestCorr * 0.82);
-    for (let lag = minLag + 1; lag < maxLag - 1; lag++) {
-      const c = correlations[lag];
-      if (c >= peakThreshold && c >= correlations[lag - 1] && c >= correlations[lag + 1]) {
-        const freq = sampleRate / lag;
-        const distance = Math.abs(1200 * Math.log2(freq / targetFreq));
-        candidates.push({ lag, corr: c, distance });
-      }
-    }
-
-    let chosenLag = bestLag;
-    if (candidates.length) {
-      candidates.sort((a, b) => {
-        // Сначала предпочитаем пик, близкий к целевой частоте, но только
-        // если его корреляция действительно достаточно хорошая.
-        const scoreA = a.distance + (bestCorr - a.corr) * 1800;
-        const scoreB = b.distance + (bestCorr - b.corr) * 1800;
-        return scoreA - scoreB;
-      });
-      chosenLag = candidates[0].lag;
-    }
-
-    // Явная защита от октавной ошибки: если найденная частота близка к
-    // половине/удвоенной целевой, проверяем соседний период и выбираем
-    // вариант, который лучше согласуется с фундаментальной частотой.
-    const octaveAlternatives = [chosenLag * 2, Math.round(chosenLag / 2)];
-    let chosenCorr = correlations[chosenLag];
-    for (const lag of octaveAlternatives) {
-      if (lag >= minLag && lag <= maxLag) {
-        const c = correlations[lag];
-        if (c >= chosenCorr * 0.86) {
-          const currentFreq = sampleRate / chosenLag;
-          const altFreq = sampleRate / lag;
-          if (Math.abs(Math.log2(altFreq / targetFreq)) <
-              Math.abs(Math.log2(currentFreq / targetFreq))) {
-            chosenLag = lag;
-            chosenCorr = c;
-          }
+    // Если порог не достигнут, берём лучший минимум только в пределах
+    // выбранной струны. Это позволяет работать с более тихим звуком.
+    if (tau < 0) {
+      let best = Infinity;
+      for (let t = minLag; t <= maxLag; t++) {
+        if (cmnd[t] < best) {
+          best = cmnd[t];
+          tau = t;
         }
       }
+      if (tau < 0 || !Number.isFinite(cmnd[tau]) || cmnd[tau] > 0.42) return null;
     }
 
-    let refined = chosenLag;
-    if (chosenLag > minLag && chosenLag < maxLag) {
-      const y1 = correlations[chosenLag - 1];
-      const y2 = correlations[chosenLag];
-      const y3 = correlations[chosenLag + 1];
+    // Параболическая интерполяция минимума даёт более точную частоту.
+    let refined = tau;
+    if (tau > minLag && tau < maxLag) {
+      const y1 = cmnd[tau - 1];
+      const y2 = cmnd[tau];
+      const y3 = cmnd[tau + 1];
       const denom = y1 - 2 * y2 + y3;
       if (Math.abs(denom) > 1e-9) {
         refined += 0.5 * (y1 - y3) / denom;
@@ -277,7 +251,14 @@
     }
 
     const freq = sampleRate / refined;
-    return Number.isFinite(freq) && freq >= minFreq && freq <= maxFreq ? freq : null;
+    if (!Number.isFinite(freq) || freq < minFreq || freq > maxFreq) return null;
+
+    // Дополнительная проверка периодичности. Очень случайный шум не должен
+    // превращаться в «ноту».
+    const confidence = 1 - cmnd[tau];
+    if (confidence < 0.55) return null;
+
+    return freq;
   }
 
   // Небольшое усреднение нескольких кадров делает тюнер устойчивее:
@@ -291,11 +272,12 @@
 
   function updateResult(freq) {
     pitchHistory.push(freq);
-    if (pitchHistory.length > 7) pitchHistory.shift();
-    if (pitchHistory.length < 2) return;
+    if (pitchHistory.length > 9) pitchHistory.shift();
+    if (pitchHistory.length < 3) return;
 
     const sorted = [...pitchHistory].sort((a, b) => a - b);
-    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+    const trimmed = sorted.length >= 7 ? sorted.slice(1, -1) : sorted;
+    const medianFreq = trimmed[Math.floor(trimmed.length / 2)];
     const detected = noteFromFrequency(medianFreq);
     if (!detected) return;
 
