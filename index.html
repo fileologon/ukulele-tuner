@@ -167,10 +167,10 @@
     return { name: notes[pc][0] + octave, cents };
   }
 
-  // Autocorrelation pitch detector. It is intentionally simple and runs locally.
+  // Устойчивое определение высоты тона. Поскольку пользователь заранее
+  // выбирает струну, используем её частоту как подсказку: это сильно
+  // уменьшает ошибки на октаву и скачки между гармониками.
   function detectPitch(data, sampleRate) {
-    // Автокорреляция с более мягким порогом чувствительности.
-    // Перед расчётом убираем постоянную составляющую микрофона.
     let mean = 0;
     for (let i = 0; i < data.length; i++) mean += data[i];
     mean /= data.length;
@@ -181,13 +181,16 @@
       energy += x * x;
     }
     const rms = Math.sqrt(energy / data.length);
-    if (rms < 0.003) return null;
+    if (rms < 0.0007) return null;
 
-    // Диапазон шире нот укулеле, чтобы не терять тихие/слегка неточные ноты.
-    const minFreq = 120;
-    const maxFreq = 900;
+    // Для настройки ищем фундаментальную частоту вокруг выбранной струны.
+    // Диапазон примерно от -600 до +600 центов допускает заметно расстроенную
+    // струну, но не даёт алгоритму свободно перескакивать между октавами.
+    const targetFreq = target.freq;
+    const minFreq = Math.max(70, targetFreq * Math.pow(2, -0.52));
+    const maxFreq = Math.min(900, targetFreq * Math.pow(2, 0.52));
     const minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
-    const maxLag = Math.min(Math.floor(sampleRate / minFreq), data.length - 2);
+    const maxLag = Math.min(Math.ceil(sampleRate / minFreq), data.length - 2);
 
     const corrAt = (lag) => {
       let corr = 0, normA = 0, normB = 0;
@@ -203,8 +206,8 @@
     };
 
     const correlations = new Float32Array(maxLag + 1);
-    let bestLag = -1;
     let bestCorr = -1;
+    let bestLag = -1;
 
     for (let lag = minLag; lag <= maxLag; lag++) {
       const c = corrAt(lag);
@@ -215,34 +218,58 @@
       }
     }
 
-    // Тихий, но периодический звук тоже принимаем.
-    if (bestLag < 0 || bestCorr < 0.30) return null;
+    if (bestLag < 0 || bestCorr < 0.12) return null;
 
-    // Ищем локальные пики. Если основной период имеет более сильную гармонику,
-    // выбираем наиболее ранний достаточно хороший пик, но не слишком рано,
-    // чтобы не превращать ноту в её октаву.
-    let peakLag = bestLag;
-    const threshold = Math.max(0.30, bestCorr * 0.72);
+    // Собираем локальные пики автокорреляции. Если несколько пиков почти
+    // одинаково сильны, выбираем тот, чья частота ближе к выбранной струне.
+    const candidates = [];
+    const peakThreshold = Math.max(0.12, bestCorr * 0.82);
     for (let lag = minLag + 1; lag < maxLag - 1; lag++) {
       const c = correlations[lag];
-      if (c >= threshold && c >= correlations[lag - 1] && c >= correlations[lag + 1]) {
-        peakLag = lag;
-        break;
+      if (c >= peakThreshold && c >= correlations[lag - 1] && c >= correlations[lag + 1]) {
+        const freq = sampleRate / lag;
+        const distance = Math.abs(1200 * Math.log2(freq / targetFreq));
+        candidates.push({ lag, corr: c, distance });
       }
     }
 
-    // Если ранний пик оказался явно гармоникой, сравниваем его с двойным периодом.
-    // Это особенно помогает струнам укулеле, у которых гармоники выражены сильно.
-    const doubled = peakLag * 2;
-    if (doubled <= maxLag && correlations[doubled] > correlations[peakLag] * 0.92) {
-      peakLag = doubled;
+    let chosenLag = bestLag;
+    if (candidates.length) {
+      candidates.sort((a, b) => {
+        // Сначала предпочитаем пик, близкий к целевой частоте, но только
+        // если его корреляция действительно достаточно хорошая.
+        const scoreA = a.distance + (bestCorr - a.corr) * 1800;
+        const scoreB = b.distance + (bestCorr - b.corr) * 1800;
+        return scoreA - scoreB;
+      });
+      chosenLag = candidates[0].lag;
     }
 
-    let refined = peakLag;
-    if (peakLag > minLag && peakLag < maxLag) {
-      const y1 = correlations[peakLag - 1];
-      const y2 = correlations[peakLag];
-      const y3 = correlations[peakLag + 1];
+    // Явная защита от октавной ошибки: если найденная частота близка к
+    // половине/удвоенной целевой, проверяем соседний период и выбираем
+    // вариант, который лучше согласуется с фундаментальной частотой.
+    const octaveAlternatives = [chosenLag * 2, Math.round(chosenLag / 2)];
+    let chosenCorr = correlations[chosenLag];
+    for (const lag of octaveAlternatives) {
+      if (lag >= minLag && lag <= maxLag) {
+        const c = correlations[lag];
+        if (c >= chosenCorr * 0.86) {
+          const currentFreq = sampleRate / chosenLag;
+          const altFreq = sampleRate / lag;
+          if (Math.abs(Math.log2(altFreq / targetFreq)) <
+              Math.abs(Math.log2(currentFreq / targetFreq))) {
+            chosenLag = lag;
+            chosenCorr = c;
+          }
+        }
+      }
+    }
+
+    let refined = chosenLag;
+    if (chosenLag > minLag && chosenLag < maxLag) {
+      const y1 = correlations[chosenLag - 1];
+      const y2 = correlations[chosenLag];
+      const y3 = correlations[chosenLag + 1];
       const denom = y1 - 2 * y2 + y3;
       if (Math.abs(denom) > 1e-9) {
         refined += 0.5 * (y1 - y3) / denom;
@@ -264,7 +291,7 @@
 
   function updateResult(freq) {
     pitchHistory.push(freq);
-    if (pitchHistory.length > 5) pitchHistory.shift();
+    if (pitchHistory.length > 7) pitchHistory.shift();
     if (pitchHistory.length < 2) return;
 
     const sorted = [...pitchHistory].sort((a, b) => a - b);
@@ -290,23 +317,26 @@
     // Голосовое сообщение повторяем только при заметном изменении,
     // чтобы скринридер не зачитывал одно и то же десятки раз в секунду.
     const centsChanged = lastAnnouncedCents === null ||
-      Math.abs(centsToTarget - lastAnnouncedCents) >= 8;
+      Math.abs(centsToTarget - lastAnnouncedCents) >= 4;
     const nameChanged = detected.name !== lastAnnouncedName;
     const now = performance.now();
+    const timeForRepeat = now - lastAnnouncementTime >= 1400;
 
+    // Не замолкаем, когда струна приближается к эталону:
+    // скринридер получает новое сообщение примерно раз в 1,4 секунды.
     if (abs <= 5) {
-      if (now - lastTunedAnnouncement > 1200 || nameChanged) {
-        announce(`${target.stringName}, ${target.note}. Вы сыграли правильно. Настроено.`, true);
+      if (now - lastTunedAnnouncement > 1400 || nameChanged) {
+        announce(`${target.stringName}, ${target.note}. Вы сыграли правильно. Отклонение ${abs.toFixed(0)} центов. Настроено.`, true);
         lastTunedAnnouncement = now;
         lastAnnouncedCents = centsToTarget;
         lastAnnouncedName = detected.name;
       }
-    } else if (centsChanged || nameChanged) {
+    } else if (centsChanged || nameChanged || timeForRepeat) {
       const direction = centsToTarget < 0 ? "ниже" : "выше";
       announce(
         `Вы сыграли ${detected.name}. Частота ${formatHz(medianFreq)} Гц. ` +
         `Это ${direction} нужной ноты ${target.note} на ${abs.toFixed(0)} центов. ${status}`,
-        false
+        true
       );
       lastAnnouncedCents = centsToTarget;
       lastAnnouncedName = detected.name;
