@@ -169,8 +169,8 @@
 
   // Autocorrelation pitch detector. It is intentionally simple and runs locally.
   function detectPitch(data, sampleRate) {
-    // Надёжнее для голоса/струн: убираем постоянную составляющую,
-    // затем ищем период сигнала автокорреляцией.
+    // Автокорреляция с более мягким порогом чувствительности.
+    // Перед расчётом убираем постоянную составляющую микрофона.
     let mean = 0;
     for (let i = 0; i < data.length; i++) mean += data[i];
     mean /= data.length;
@@ -181,11 +181,11 @@
       energy += x * x;
     }
     const rms = Math.sqrt(energy / data.length);
-    if (rms < 0.008) return null;
+    if (rms < 0.003) return null;
 
-    // Для укулеле достаточно уверенно искать основной тон в этом диапазоне.
-    const minFreq = 180;
-    const maxFreq = 700;
+    // Диапазон шире нот укулеле, чтобы не терять тихие/слегка неточные ноты.
+    const minFreq = 120;
+    const maxFreq = 900;
     const minLag = Math.max(2, Math.floor(sampleRate / maxFreq));
     const maxLag = Math.min(Math.floor(sampleRate / minFreq), data.length - 2);
 
@@ -202,10 +202,10 @@
       return corr / Math.sqrt((normA * normB) || 1);
     };
 
-    // Сначала считаем корреляцию на всех лагах.
     const correlations = new Float32Array(maxLag + 1);
     let bestLag = -1;
     let bestCorr = -1;
+
     for (let lag = minLag; lag <= maxLag; lag++) {
       const c = corrAt(lag);
       correlations[lag] = c;
@@ -215,12 +215,14 @@
       }
     }
 
-    if (bestLag < 0 || bestCorr < 0.45) return null;
+    // Тихий, но периодический звук тоже принимаем.
+    if (bestLag < 0 || bestCorr < 0.30) return null;
 
-    // Ищем первый выраженный локальный максимум. Это уменьшает риск,
-    // что вместо основной частоты будет выбрана её гармоника.
+    // Ищем локальные пики. Если основной период имеет более сильную гармонику,
+    // выбираем наиболее ранний достаточно хороший пик, но не слишком рано,
+    // чтобы не превращать ноту в её октаву.
     let peakLag = bestLag;
-    const threshold = Math.max(0.45, bestCorr * 0.82);
+    const threshold = Math.max(0.30, bestCorr * 0.72);
     for (let lag = minLag + 1; lag < maxLag - 1; lag++) {
       const c = correlations[lag];
       if (c >= threshold && c >= correlations[lag - 1] && c >= correlations[lag + 1]) {
@@ -229,7 +231,13 @@
       }
     }
 
-    // Параболическая интерполяция даёт более точную частоту между отсчётами.
+    // Если ранний пик оказался явно гармоникой, сравниваем его с двойным периодом.
+    // Это особенно помогает струнам укулеле, у которых гармоники выражены сильно.
+    const doubled = peakLag * 2;
+    if (doubled <= maxLag && correlations[doubled] > correlations[peakLag] * 0.92) {
+      peakLag = doubled;
+    }
+
     let refined = peakLag;
     if (peakLag > minLag && peakLag < maxLag) {
       const y1 = correlations[peakLag - 1];
@@ -242,41 +250,70 @@
     }
 
     const freq = sampleRate / refined;
-    return Number.isFinite(freq) ? freq : null;
+    return Number.isFinite(freq) && freq >= minFreq && freq <= maxFreq ? freq : null;
   }
 
-  function updateResult(freq) {
-    const detected = noteFromFrequency(freq);
-    if (!detected) {
-      detectedText.textContent = "Нота не определена.";
-      frequencyText.textContent = "Частота: —";
-      centsText.textContent = "Отклонение: —";
-      statusText.textContent = "Сыграйте выбранную струну отдельно.";
-      return;
-    }
+  // Небольшое усреднение нескольких кадров делает тюнер устойчивее:
+  // одна неудачная выборка больше не приводит к «нота не определена».
+  const pitchHistory = [];
+  let lastDisplayedCents = null;
+  let lastDetectedName = "";
+  let lastAnnouncedCents = null;
+  let lastAnnouncedName = "";
+  let lastTunedAnnouncement = 0;
 
-    const centsToTarget = 1200 * Math.log2(freq / target.freq);
+  function updateResult(freq) {
+    pitchHistory.push(freq);
+    if (pitchHistory.length > 5) pitchHistory.shift();
+    if (pitchHistory.length < 2) return;
+
+    const sorted = [...pitchHistory].sort((a, b) => a - b);
+    const medianFreq = sorted[Math.floor(sorted.length / 2)];
+    const detected = noteFromFrequency(medianFreq);
+    if (!detected) return;
+
+    const centsToTarget = 1200 * Math.log2(medianFreq / target.freq);
     const abs = Math.abs(centsToTarget);
 
     detectedText.textContent = `Обнаружена нота: ${detected.name}.`;
-    frequencyText.textContent = `Частота: ${formatHz(freq)} Гц.`;
+    frequencyText.textContent = `Частота: ${formatHz(medianFreq)} Гц.`;
     centsText.textContent =
       `Отклонение от ${target.note}: ${centsToTarget >= 0 ? "+" : ""}${centsToTarget.toFixed(1)} цента.`;
 
     let status;
-    if (abs <= 3) status = "Настроено.";
+    // 5 центов — хорошая практическая точность для укулеле.
+    if (abs <= 5) status = "Настроено правильно.";
     else if (centsToTarget < 0) status = "Ниже нормы. Натяните струну.";
     else status = "Выше нормы. Ослабьте струну.";
-
     statusText.textContent = status;
 
-    const direction = centsToTarget < 0 ? "ниже" : "выше";
-    const announcement =
-      `Вы сыграли ${detected.name}. Частота ${formatHz(freq)} Гц. ` +
-      `Это ${direction} нужной ноты ${target.note} на ${abs.toFixed(0)} центов. ${status}`;
+    // Голосовое сообщение повторяем только при заметном изменении,
+    // чтобы скринридер не зачитывал одно и то же десятки раз в секунду.
+    const centsChanged = lastAnnouncedCents === null ||
+      Math.abs(centsToTarget - lastAnnouncedCents) >= 8;
+    const nameChanged = detected.name !== lastAnnouncedName;
+    const now = performance.now();
 
-    if (abs <= 3) announce(`${target.stringName}, ${target.note}. Настроено.`, false);
-    else announce(announcement, false);
+    if (abs <= 5) {
+      if (now - lastTunedAnnouncement > 1200 || nameChanged) {
+        announce(`${target.stringName}, ${target.note}. Вы сыграли правильно. Настроено.`, true);
+        lastTunedAnnouncement = now;
+        lastAnnouncedCents = centsToTarget;
+        lastAnnouncedName = detected.name;
+      }
+    } else if (centsChanged || nameChanged) {
+      const direction = centsToTarget < 0 ? "ниже" : "выше";
+      announce(
+        `Вы сыграли ${detected.name}. Частота ${formatHz(medianFreq)} Гц. ` +
+        `Это ${direction} нужной ноты ${target.note} на ${abs.toFixed(0)} центов. ${status}`,
+        false
+      );
+      lastAnnouncedCents = centsToTarget;
+      lastAnnouncedName = detected.name;
+    }
+
+    lastDisplayedCents = centsToTarget;
+    lastDetectedName = detected.name;
   }
 
   async function startMic() {
@@ -305,6 +342,10 @@
       source.connect(analyser);
       buffer = new Float32Array(analyser.fftSize);
 
+      pitchHistory.length = 0;
+      lastAnnouncedCents = null;
+      lastAnnouncedName = "";
+      lastTunedAnnouncement = 0;
       running = true;
       micButton.textContent = "Выключить микрофон";
       statusText.textContent = "Микрофон включён. Сыграйте выбранную струну.";
@@ -321,6 +362,7 @@
 
   function stopMic() {
     running = false;
+    pitchHistory.length = 0;
     if (stream) stream.getTracks().forEach(track => track.stop());
     if (source) source.disconnect();
     if (audioContext) audioContext.close();
@@ -356,6 +398,9 @@
         stringName: button.textContent.trim().split("—")[0].trim()
       };
 
+      pitchHistory.length = 0;
+      lastAnnouncedCents = null;
+      lastAnnouncedName = "";
       targetText.textContent = `${target.stringName}, ${target.note}`;
       targetFreq.textContent = `${formatHz(target.freq)} Гц`;
       statusText.textContent = `Выбрана ${target.stringName}, ${target.note}.`;
